@@ -296,11 +296,99 @@ def find_gates(img: Image, out: Console | None = None) -> list[GateSite]:
     return gates
 
 
-def site_state(img: Image, gate: GateSite) -> tuple[str, int | None]:
-    off = img.rva_to_offset(gate.begin_rva)
+@dataclass
+class PatchSite:
+    kind: str
+    rva: int
+    offset: int | None
+    payload: bytes
+
+
+def site_state(img: Image, site: PatchSite) -> tuple[str, int | None]:
+    off = img.rva_to_offset(site.rva)
     if off is None:
         return "unmapped", None
-    return ("patched" if img.data[off : off + len(STUB)] == STUB else "clean"), off
+    hit = img.data[off : off + len(site.payload)] == site.payload
+    return ("patched" if hit else "clean"), off
+
+
+JCC_NEAR = range(0x80, 0x90)
+JCC_SHORT = range(0x70, 0x80)
+MODRM_REG_MASK = 0x38
+
+
+def _zero_compare_ending_at(data: bytes, p: int) -> bool:
+    """True when the bytes that end at p are a cmp/test against zero."""
+    if p >= 2 and data[p - 1] == 0xC0 and data[p - 2] in (0x84, 0x85):
+        return True
+    if p < 3 or data[p - 1] != 0x00:
+        return False
+    for span, mods in ((3, (0, 3)), (4, (1,)), (7, (2,))):
+        op = p - span
+        if op < 0 or data[op] != 0x80:
+            continue
+        modrm = data[op + 1]
+        if modrm & MODRM_REG_MASK != MODRM_REG_MASK:
+            continue
+        mod = modrm >> 6
+        if mod not in mods:
+            continue
+        if mod == 0 and modrm & 7 == 4:
+            continue
+        return True
+    return False
+
+
+def find_ok_branch(img: Image, gate: GateSite) -> tuple[int, int] | None:
+    """Locate the conditional jump that skips the gate-ok path.
+
+    Modules validate the key and then start the macro inside the same routine
+    as the marker. Stubbing its prologue skips the macro start, so modules get
+    the verdict branch neutralised instead: the routine still runs in full and
+    only the denial path becomes unreachable.
+    """
+    text = img.section(SECTION_TEXT)
+    if text is None:
+        return None
+    ok_rvas = set(img.find_string(GATE_OK))
+    if not ok_rvas:
+        return None
+    refs = sorted({insn for sites in rip_refs_to(img, ok_rvas).values() for insn in sites})
+    low = text.raw_ptr
+    for ref in refs:
+        if not (gate.begin_rva <= ref < gate.end_rva):
+            continue
+        base = low + (ref - text.va)
+        for p in range(base - 2, max(base - 64, low) - 1, -1):
+            op = img.data[p]
+            if op == 0x0F and img.data[p + 1] in JCC_NEAR:
+                rel = struct.unpack_from("<i", img.data, p + 2)[0]
+                target = text.va + (p - low) + 6 + rel
+                length = 6
+            elif op in JCC_SHORT:
+                rel = struct.unpack_from("<b", img.data, p + 1)[0]
+                target = text.va + (p - low) + 2 + rel
+                length = 2
+            else:
+                continue
+            if target <= ref:
+                continue
+            if not _zero_compare_ending_at(img.data, p):
+                continue
+            return text.va + (p - low), length
+    return None
+
+
+def plan_sites(img: Image, gate: GateSite, hub: bool, out: Console) -> list[PatchSite]:
+    if hub:
+        return [PatchSite("stub", gate.begin_rva, img.rva_to_offset(gate.begin_rva), STUB)]
+    branch = find_ok_branch(img, gate)
+    if branch is None:
+        return []
+    rva, length = branch
+    if out.verbose:
+        out.emit("debug", f"verdict branch RVA 0x{rva:X} ({length} bytes)")
+    return [PatchSite("branch", rva, img.rva_to_offset(rva), b"\x90" * length)]
 
 
 # ------------------------------------------------------------------ targets ---
@@ -361,12 +449,12 @@ class PROCESSENTRY32W(ctypes.Structure):
     ]
 
 
-def running_exopanda(exclude_pid: int = 0) -> set[str]:
-    names: set[str] = set()
+def exopanda_processes(exclude_pid: int = 0) -> list[tuple[int, str]]:
+    found: list[tuple[int, str]] = []
     kernel32 = ctypes.windll.kernel32
     snapshot = kernel32.CreateToolhelp32Snapshot(0x00000002, 0)
     if snapshot in (0, -1):
-        return names
+        return found
     try:
         entry = PROCESSENTRY32W()
         entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
@@ -375,12 +463,39 @@ def running_exopanda(exclude_pid: int = 0) -> set[str]:
                 exe = entry.szExeFile.lower()
                 if entry.th32ProcessID != exclude_pid and exe.startswith("exopanda") \
                         and "patch" not in exe:
-                    names.add(entry.szExeFile)
+                    found.append((entry.th32ProcessID, entry.szExeFile))
                 if not kernel32.Process32NextW(snapshot, ctypes.byref(entry)):
                     break
     finally:
         kernel32.CloseHandle(snapshot)
-    return names
+    return found
+
+
+def running_exopanda(exclude_pid: int = 0) -> set[str]:
+    return {name for _pid, name in exopanda_processes(exclude_pid)}
+
+
+def terminate_exopanda(out: Console, exclude_pid: int | None = None) -> int:
+    """Close the hub and every module process so their images unlock."""
+    kernel32 = ctypes.windll.kernel32
+    exclude = os.getpid() if exclude_pid is None else exclude_pid
+    killed = 0
+    for _ in range(4):
+        targets = exopanda_processes(exclude)
+        if not targets:
+            break
+        for pid, name in targets:
+            handle = kernel32.OpenProcess(0x0001, False, pid)
+            if not handle:
+                continue
+            try:
+                if kernel32.TerminateProcess(handle, 0):
+                    killed += 1
+                    out.emit("watch", f"closed {name}", f"pid {pid}")
+            finally:
+                kernel32.CloseHandle(handle)
+        time.sleep(0.6)
+    return killed
 
 
 # ---------------------------------------------------------------- patching ----
@@ -394,29 +509,58 @@ class PatchResult:
     failed: int = 0
 
 
+def planning_image(path: Path) -> Image:
+    """Structure comes from the pristine backup when one is present.
+
+    The verdict branch disappears once it is patched, so the live file can no
+    longer describe where the patch belongs. The backup still can, and it is
+    only trusted while the sizes agree - a module update changes both the
+    layout and the size, which invalidates it.
+    """
+    backup = path.with_name(path.name + BACKUP_SUFFIX)
+    if backup.exists():
+        try:
+            if backup.stat().st_size == path.stat().st_size:
+                return Image.load(backup)
+        except OSError:
+            pass
+    return Image.load(path)
+
+
 def patch_file(path: Path, root: Path, out: Console, dry_run: bool = False) -> PatchResult:
     result = PatchResult()
-    img = Image.load(path)
-    gates = find_gates(img, out)
+    img = planning_image(path)
+    live = Image.load(path)
     label = display(path, root)
+    gates = find_gates(img, out)
     if not gates:
         out.emit("err", f"{label}: gate() not located - skipped")
         result.failed += 1
         return result
 
-    todo = [g for g in gates if site_state(img, g)[0] == "clean"]
+    hub = path.parent == root
+    sites: list[PatchSite] = []
+    for gate in gates:
+        planned = plan_sites(img, gate, hub, out)
+        if not planned:
+            out.emit("warn", f"{label}: gate branch not located - left stock")
+            result.failed += 1
+            continue
+        sites.extend(planned)
+
+    todo = [s for s in sites if site_state(live, s)[0] == "clean"]
     if not todo:
-        out.emit("skip", f"{label}: already patched", f"{len(gates)} site(s)")
+        out.emit("skip", f"{label}: already patched", f"{len(sites)} site(s)")
         result.skipped += 1
         return result
     if is_locked(path):
-        out.emit("warn", f"{label}: locked while the process runs")
+        out.emit("warn", f"{label}: locked by a running process")
         result.locked += 1
         return result
     if dry_run:
-        for gate in todo:
-            out.emit("dry", f"{label}: would stub RVA 0x{gate.begin_rva:X}")
-        result.patched += len(todo)
+        for site in todo:
+            out.emit("dry", f"{label}: would patch {site.kind} RVA 0x{site.rva:X}")
+            result.patched += 1
         return result
 
     backup = path.with_name(path.name + BACKUP_SUFFIX)
@@ -424,15 +568,14 @@ def patch_file(path: Path, root: Path, out: Console, dry_run: bool = False) -> P
         if not backup.exists():
             shutil.copy2(path, backup)
             out.emit("ok", f"{label}: backup written", backup.name)
-        data = bytearray(img.data)
-        for gate in todo:
-            off = img.rva_to_offset(gate.begin_rva)
-            if off is None:
-                out.emit("err", f"{label}: RVA 0x{gate.begin_rva:X} not file-backed")
+        data = bytearray(live.data)
+        for site in todo:
+            if site.offset is None:
+                out.emit("err", f"{label}: RVA 0x{site.rva:X} not file-backed")
                 result.failed += 1
                 continue
-            data[off : off + len(STUB)] = STUB
-            out.emit("debug", f"{label}: 28-byte stub -> file 0x{off:X}")
+            data[site.offset : site.offset + len(site.payload)] = site.payload
+            out.emit("debug", f"{label}: {site.kind} -> file 0x{site.offset:X}")
         path.write_bytes(bytes(data))
     except PermissionError:
         out.emit("warn", f"{label}: locked - close ExoPanda and its modules, then retry")
@@ -444,17 +587,14 @@ def patch_file(path: Path, root: Path, out: Console, dry_run: bool = False) -> P
         out.emit("err", f"{label}: size changed - run restore")
         result.failed += 1
         return result
-    for gate in todo:
-        state, off = site_state(written, gate)
+    for site in todo:
+        state, off = site_state(written, site)
         if state != "patched":
-            out.emit("err", f"{label}: verification failed at RVA 0x{gate.begin_rva:X}")
+            out.emit("err", f"{label}: verification failed at RVA 0x{site.rva:X}")
             result.failed += 1
         else:
-            out.emit(
-                "ok",
-                f"{label}: gate() stubbed",
-                f"RVA 0x{gate.begin_rva:X}  file 0x{off:X}  size unchanged",
-            )
+            what = "gate() stubbed" if site.kind == "stub" else "verdict branch forced"
+            out.emit("ok", f"{label}: {what}", f"RVA 0x{site.rva:X}  file 0x{off:X}")
             result.patched += 1
     return result
 
@@ -471,51 +611,79 @@ def cmd_status(root: Path, out: Console) -> int:
 
     clean = patched = 0
     for path in paths:
-        img = Image.load(path)
+        img = planning_image(path)
+        live = Image.load(path)
         gates = find_gates(img, out)
         label = display(path, root)
+        hub = path.parent == root
         out.rule(label)
         if not gates:
             out.emit("warn", f"{label}: gate() not located")
             continue
         for gate in gates:
-            state, off = site_state(img, gate)
-            where = "" if off is None else f"file 0x{off:X}"
-            detail = (
-                f"RVA 0x{gate.begin_rva:X}  0x{gate.end_rva - gate.begin_rva:X} bytes"
-                f"  {gate.markers} markers  {where}"
-            )
-            if state == "patched":
-                out.emit("ok", "gate() stubbed", detail)
-                patched += 1
-            elif state == "clean":
-                out.emit("info", "gate() untouched", detail)
-                clean += 1
-            else:
-                out.emit("warn", "gate() unmapped", detail)
+            planned = plan_sites(img, gate, hub, out)
+            if not planned:
+                out.emit("warn", "verdict branch not located", f"RVA 0x{gate.begin_rva:X}")
+                continue
+            for site in planned:
+                state, off = site_state(live, site)
+                where = "" if off is None else f"file 0x{off:X}"
+                detail = (
+                    f"RVA 0x{site.rva:X}  0x{gate.end_rva - gate.begin_rva:X} bytes"
+                    f"  {gate.markers} markers  {where}"
+                )
+                what = "gate() stubbed" if site.kind == "stub" else "verdict branch forced"
+                if state == "patched":
+                    out.emit("ok", what, detail)
+                    patched += 1
+                elif state == "clean":
+                    out.emit("info", f"untouched ({site.kind})", detail)
+                    clean += 1
+                else:
+                    out.emit("warn", "gate() unmapped", detail)
         backup = path.with_name(path.name + BACKUP_SUFFIX)
         out.emit("debug", f"backup {'present' if backup.exists() else 'absent'}")
+        if is_locked(path):
+            out.emit("warn", f"{label}: in use by a running process")
 
     out.rule()
     out.emit("info", f"{len(paths)} gated binary(ies)", f"{patched} patched, {clean} clean")
     return 0
 
 
-def cmd_patch(root: Path, out: Console, dry_run: bool) -> int:
+def cmd_patch(root: Path, out: Console, dry_run: bool, wait: float = 0.0,
+              scope: str = "all", kill: bool = True) -> int:
     out.header(f"patch {root}")
+    if kill and not dry_run:
+        closed = terminate_exopanda(out)
+        if closed:
+            out.emit("info", "app closed", f"{closed} process(es)")
     paths = gated_files(root, out)
+    if scope == "hub":
+        paths = [p for p in paths if p.parent == root]
+    elif scope == "modules":
+        paths = [p for p in paths if p.parent != root]
     if not paths:
-        out.emit("err", f"no gated binaries under {root}")
+        out.emit("err", f"no gated binaries in scope '{scope}' under {root}")
         return 1
 
+    deadline = time.monotonic() + max(wait, 0.0)
     total = PatchResult()
-    for path in paths:
-        out.rule(display(path, root))
-        res = patch_file(path, root, out, dry_run)
-        total.patched += res.patched
-        total.skipped += res.skipped
-        total.locked += res.locked
-        total.failed += res.failed
+    while True:
+        total = PatchResult()
+        for path in paths:
+            out.rule(display(path, root))
+            res = patch_file(path, root, out, dry_run)
+            total.patched += res.patched
+            total.skipped += res.skipped
+            total.locked += res.locked
+            total.failed += res.failed
+
+        if not total.locked or dry_run or time.monotonic() >= deadline:
+            break
+        left = int(deadline - time.monotonic())
+        out.emit("info", "waiting for the app to exit", f"{total.locked} locked, {left}s left")
+        time.sleep(2)
 
     out.rule()
     if dry_run:
@@ -524,11 +692,18 @@ def cmd_patch(root: Path, out: Console, dry_run: bool) -> int:
         out.emit("warn", f"completed with {total.failed} failure(s)")
     else:
         out.emit("ok", "exopanda vibecoded slop patched ez", f"{total.patched} site(s)")
+    if total.locked:
+        out.emit("warn", f"{total.locked} file(s) still locked - close ExoPanda, then run patch again")
+        out.emit("info", "or run", "HayyanPatcher.exe patch --wait 300")
     return 1 if total.failed else 0
 
 
-def cmd_restore(root: Path, out: Console) -> int:
+def cmd_restore(root: Path, out: Console, kill: bool = True) -> int:
     out.header(f"restore {root}")
+    if kill:
+        closed = terminate_exopanda(out)
+        if closed:
+            out.emit("info", "app closed", f"{closed} process(es)")
     restored = locked = 0
     for backup in sorted(root.rglob(f"*{BACKUP_SUFFIX}")):
         target = backup.with_name(backup.name[: -len(BACKUP_SUFFIX)])
@@ -551,12 +726,66 @@ def cmd_restore(root: Path, out: Console) -> int:
     return 1 if locked else 0
 
 
-def cmd_auto(root: Path, out: Console, interval: float) -> int:
+def cmd_diag(root: Path, out: Console) -> int:
+    out.header(f"diag {root}")
+    procs = running_exopanda(os.getpid())
+    out.emit("info", "processes", ", ".join(sorted(procs)) if procs else "none")
+
+    gated_seen = 0
+    for path in sorted(root.rglob("*.exe")):
+        label = display(path, root)
+        try:
+            data = path.read_bytes()
+        except OSError as exc:
+            out.rule(label)
+            out.emit("err", "unreadable", str(exc))
+            continue
+
+        out.rule(label)
+        out.emit("info", "size", f"{len(data)} bytes")
+        if GATE_OK not in data:
+            out.emit("skip", "no gate marker")
+            continue
+        gated_seen += 1
+
+        img = planning_image(path)
+        live = Image.load(path)
+        gates = find_gates(img, out if out.verbose else None)
+        hub = path.parent == root
+        if not gates:
+            out.emit("warn", "gate() not located - markers present but no matching function")
+        for gate in gates:
+            planned = plan_sites(img, gate, hub, out)
+            if not planned:
+                out.emit("warn", "verdict branch not located", f"RVA 0x{gate.begin_rva:X}")
+                continue
+            for site in planned:
+                state, off = site_state(live, site)
+                where = "unmapped" if off is None else f"file 0x{off:X}"
+                out.emit("info", f"{site.kind} {state}",
+                         f"RVA 0x{site.rva:X}  0x{gate.end_rva - gate.begin_rva:X} bytes"
+                         f"  {gate.markers} markers  {where}")
+        out.emit("info", "locked", "yes" if is_locked(path) else "no")
+        out.emit("info", "backup",
+                 "present" if path.with_name(path.name + BACKUP_SUFFIX).exists() else "absent")
+
+    out.rule()
+    if not (root / "ExoPanda.exe").exists():
+        out.emit("warn", "hub not found at this root - pass --root <install dir> if it lives elsewhere")
+    out.emit("info", f"{gated_seen} gated binary(ies) found")
+    return 0
+
+
+def cmd_auto(root: Path, out: Console, interval: float, kill: bool = False) -> int:
+    if kill:
+        closed = terminate_exopanda(out)
+        if closed:
+            out.emit("info", "app closed", f"{closed} process(es)")
     out.emit("info", "watching", f"{root}")
 
     known: dict[Path, tuple[int, int]] = {}
     gated: set[Path] = set()
-    sites: dict[Path, list[tuple[int, int]]] = {}
+    sites: dict[Path, list[tuple[int, bytes]]] = {}
     pending: set[Path] = set()
     last_procs: set[str] = set()
     rescan_at = 0.0
@@ -571,7 +800,7 @@ def cmd_auto(root: Path, out: Console, interval: float) -> int:
         return (st.st_mtime_ns, st.st_size)
 
     def probe(path: Path) -> str:
-        """cheap state read using cached gate offsets; 'unknown' forces a rescan"""
+        """cheap state read using cached patch offsets; 'unknown' forces a rescan"""
         key = stat_key(path)
         if key is None:
             return "missing"
@@ -579,9 +808,9 @@ def cmd_auto(root: Path, out: Console, interval: float) -> int:
             return "unknown"
         try:
             with open(path, "rb") as handle:
-                for _begin, off in sites[path]:
+                for off, payload in sites[path]:
                     handle.seek(off)
-                    if handle.read(len(STUB)) != STUB:
+                    if handle.read(len(payload)) != payload:
                         return "clean"
         except OSError:
             return "unknown"
@@ -625,12 +854,16 @@ def cmd_auto(root: Path, out: Console, interval: float) -> int:
 
                 state = probe(path)
                 if state == "unknown":
-                    img = Image.load(path)
+                    img = planning_image(path)
+                    live = Image.load(path)
                     gates = find_gates(img, out)
+                    hub = path.parent == root
                     offsets = [
-                        (gate.begin_rva, off)
+                        (off, payload)
                         for gate in gates
-                        if (off := img.rva_to_offset(gate.begin_rva)) is not None
+                        for site in plan_sites(img, gate, hub, out)
+                        if (off := img.rva_to_offset(site.rva)) is not None
+                        for payload in (site.payload,)
                     ]
                     if not offsets:
                         out.emit("warn", f"{display(path, root)}: gate() not located, untracked")
@@ -641,7 +874,7 @@ def cmd_auto(root: Path, out: Console, interval: float) -> int:
                     sites[path] = offsets
                     known[path] = key
                     state = "patched" if all(
-                        img.data[off : off + len(STUB)] == STUB for _b, off in offsets
+                        live.data[off : off + len(payload)] == payload for off, payload in offsets
                     ) else "clean"
 
                 if state == "patched":
@@ -692,7 +925,7 @@ def main(argv: list[str]) -> int:
         "action",
         nargs="?",
         default="auto",
-        choices=("auto", "status", "patch", "restore"),
+        choices=("auto", "status", "patch", "diag", "restore"),
         help="auto (default): patch now, then watch for new or updated binaries",
     )
     parser.add_argument(
@@ -703,6 +936,14 @@ def main(argv: list[str]) -> int:
     )
     parser.add_argument("--dry-run", action="store_true", help="report without writing")
     parser.add_argument("--interval", type=float, default=2.0, help="watch poll seconds")
+    parser.add_argument("--wait", type=float, default=0.0,
+                        help="patch: keep retrying locked files for N seconds")
+    parser.add_argument("--hub-only", action="store_true",
+                        help="patch: only the launcher, leave module binaries stock")
+    parser.add_argument("--modules-only", action="store_true",
+                        help="patch: only module binaries, leave the launcher stock")
+    parser.add_argument("--no-kill", action="store_true",
+                        help="do not close ExoPanda or its modules before writing")
     parser.add_argument("-v", "--verbose", action="store_true", help="debug logging")
     parser.add_argument("--no-color", action="store_true", help="disable ANSI colors")
     args = parser.parse_args(argv[1:])
@@ -713,13 +954,22 @@ def main(argv: list[str]) -> int:
         out.emit("err", f"install directory not found: {root}")
         return 1
 
+    scope = "all"
+    if args.hub_only:
+        scope = "hub"
+    elif args.modules_only:
+        scope = "modules"
+    kill = not args.no_kill
+
     if args.action == "status":
         return cmd_status(root, out)
     if args.action == "patch":
-        return cmd_patch(root, out, args.dry_run)
+        return cmd_patch(root, out, args.dry_run, args.wait, scope, kill)
+    if args.action == "diag":
+        return cmd_diag(root, out)
     if args.action == "restore":
-        return cmd_restore(root, out)
-    return cmd_auto(root, out, max(0.5, args.interval))
+        return cmd_restore(root, out, kill)
+    return cmd_auto(root, out, max(0.5, args.interval), kill)
 
 
 if __name__ == "__main__":
