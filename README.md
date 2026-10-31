@@ -54,13 +54,22 @@ watches.
 
 `--no-kill` disables the close step.
 
-## Two patch shapes
+## Patch shape
 
-The hub and the modules do not use the same shape, so the patcher picks per
-binary:
+Both the hub and the modules get the same two surgical edits, because both
+routines do real work that must keep running — dispatch and key handoff in the
+hub, engine load and macro start in a module:
 
-**Hub — prologue stub (28 bytes).** The hub only asks the gate for a verdict
-before dispatching a module, so the whole routine can be replaced:
+**Verdict branch forced.** The conditional jump that skips the `gate-ok` path
+becomes NOPs. The routine still runs in full; only the denial path is
+unreachable.
+
+**Signature verifier stubbed.** The routine that returns `bad_signature` gets a
+five-byte prologue that returns success, so the signature on the key state is no
+longer checked.
+
+If the branch pattern cannot be found (a reshaped build), the hub falls back to
+replacing the prologue of `gate()` outright:
 
 ```
 xor  rax, rax
@@ -71,17 +80,6 @@ mov  [rcx], rax          ; Ok(())
 mov  rax, rcx
 ret
 ```
-
-**Modules — verdict branch forced + verifier stubbed.** A module's gate lives
-inside the same routine that loads its engine DLL and starts the macro.
-Replacing its prologue would skip the macro start entirely — the window opens,
-the macro does nothing. Instead the patcher makes two smaller edits:
-
-- the conditional jump that skips the `gate-ok` path becomes NOPs, so the
-  routine runs in full and only the denial path is unreachable
-- the entitlement verifier — the routine that returns `bad_signature` — gets a
-  five-byte prologue that returns success, so the signature on the key state is
-  no longer checked
 
 ## Key state
 

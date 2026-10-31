@@ -409,20 +409,20 @@ def find_verify_function(img: Image, gate: GateSite, out: Console) -> int | None
 
 
 def plan_sites(img: Image, gate: GateSite, hub: bool, out: Console) -> list[PatchSite]:
-    if hub:
-        return [PatchSite("stub", gate.begin_rva, img.rva_to_offset(gate.begin_rva), STUB)]
-    sites: list[PatchSite] = []
     branch = find_ok_branch(img, gate)
+    verify = find_verify_function(img, gate, out)
+    sites: list[PatchSite] = []
     if branch is not None:
         rva, length = branch
         if out.verbose:
             out.emit("debug", f"verdict branch RVA 0x{rva:X} ({length} bytes)")
         sites.append(PatchSite("branch", rva, img.rva_to_offset(rva), b"\x90" * length))
-    verify = find_verify_function(img, gate, out)
     if verify is not None:
         if out.verbose:
             out.emit("debug", f"signature verifier RVA 0x{verify:X}")
         sites.append(PatchSite("verify", verify, img.rva_to_offset(verify), VERIFY_STUB))
+    if hub and not sites:
+        sites.append(PatchSite("stub", gate.begin_rva, img.rva_to_offset(gate.begin_rva), STUB))
     return sites
 
 
