@@ -25,6 +25,7 @@ HayyanPatcher.bat status           report only
 HayyanPatcher.bat patch            one pass, exit
 HayyanPatcher.bat diag             per-binary detail: marker, site, lock, backup
 HayyanPatcher.bat key              re-plant the key state
+HayyanPatcher.bat key --real-key   put the real saved key state back
 HayyanPatcher.bat restore          roll back from .orig backups
 HayyanPatcher.bat -v               verbose discovery log
 ```

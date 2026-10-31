@@ -778,9 +778,30 @@ def cmd_status(root: Path, out: Console) -> int:
     return 0
 
 
-def cmd_key(out: Console, dry_run: bool = False) -> int:
+def restore_real_key(out: Console, dry_run: bool = False) -> bool:
+    path = keystate_path()
+    keep = path.with_name(path.name + ".real")
+    if not keep.exists():
+        out.emit("warn", f"no {keep.name} found - nothing to restore")
+        return False
+    if dry_run:
+        out.emit("dry", f"would restore {keep}", f"-> {path}")
+        return True
+    try:
+        if path.exists():
+            os.chmod(path, 0o666)
+        shutil.copyfile(keep, path)
+        os.chmod(path, 0o666)
+    except OSError as exc:
+        out.emit("err", f"key state not restored: {exc}")
+        return False
+    out.emit("ok", "real key state restored", str(path))
+    return True
+
+
+def cmd_key(out: Console, dry_run: bool = False, real: bool = False) -> int:
     out.header(f"key {keystate_path()}")
-    ok = write_keystate(out, dry_run)
+    ok = restore_real_key(out, dry_run) if real else write_keystate(out, dry_run)
     out.rule()
     out.emit("ok" if ok else "warn", "key state ready" if ok else "key state unchanged")
     return 0 if ok else 1
@@ -1092,6 +1113,8 @@ def main(argv: list[str]) -> int:
                         help="do not close ExoPanda or its modules before writing")
     parser.add_argument("--keep-key", action="store_true",
                         help="leave the existing key state alone instead of planting one")
+    parser.add_argument("--real-key", action="store_true",
+                        help="key: put the real saved key state back instead of the planted one")
     parser.add_argument("-v", "--verbose", action="store_true", help="debug logging")
     parser.add_argument("--no-color", action="store_true", help="disable ANSI colors")
     args = parser.parse_args(argv[1:])
@@ -1113,7 +1136,7 @@ def main(argv: list[str]) -> int:
     if args.action == "status":
         return cmd_status(root, out)
     if args.action == "key":
-        return cmd_key(out, args.dry_run)
+        return cmd_key(out, args.dry_run, args.real_key)
     if args.action == "patch":
         return cmd_patch(root, out, args.dry_run, args.wait, scope, kill, keyless)
     if args.action == "diag":
