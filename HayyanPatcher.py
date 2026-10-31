@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import ctypes
 import ctypes.wintypes as wt
+import json
 import os
 import shutil
 import struct
@@ -10,6 +12,11 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+
+try:
+    import winreg
+except ImportError:  # non-Windows import for tooling
+    winreg = None
 
 STUB = bytes(
     [
@@ -24,6 +31,8 @@ STUB = bytes(
 )
 
 GATE_OK = b"[0x6B01] gate-ok"
+VERIFY_ERR = b"bad_signature"
+VERIFY_STUB = bytes((0x31, 0xC0, 0x31, 0xD2, 0xC3))  # xor eax,eax; xor edx,edx; ret
 GATE_SIBLINGS = (
     b"[0x6B02] gate-deny",
     b"[0x6B10] gate-none",
@@ -379,16 +388,42 @@ def find_ok_branch(img: Image, gate: GateSite) -> tuple[int, int] | None:
     return None
 
 
+def find_verify_function(img: Image, gate: GateSite, out: Console) -> int | None:
+    """Locate the entitlement verifier: the routine that reports bad_signature."""
+    rvas = set(img.find_string(VERIFY_ERR))
+    if not rvas:
+        return None
+    functions = img.functions()
+    if not functions:
+        return None
+    for insn in sorted({i for s in rip_refs_to(img, rvas).values() for i in s}):
+        func = function_at(functions, insn)
+        if func is None:
+            continue
+        if func[0] == gate.begin_rva:
+            if out.verbose:
+                out.emit("debug", "signature check is inlined in the gate, no verify stub")
+            continue
+        return func[0]
+    return None
+
+
 def plan_sites(img: Image, gate: GateSite, hub: bool, out: Console) -> list[PatchSite]:
     if hub:
         return [PatchSite("stub", gate.begin_rva, img.rva_to_offset(gate.begin_rva), STUB)]
+    sites: list[PatchSite] = []
     branch = find_ok_branch(img, gate)
-    if branch is None:
-        return []
-    rva, length = branch
-    if out.verbose:
-        out.emit("debug", f"verdict branch RVA 0x{rva:X} ({length} bytes)")
-    return [PatchSite("branch", rva, img.rva_to_offset(rva), b"\x90" * length)]
+    if branch is not None:
+        rva, length = branch
+        if out.verbose:
+            out.emit("debug", f"verdict branch RVA 0x{rva:X} ({length} bytes)")
+        sites.append(PatchSite("branch", rva, img.rva_to_offset(rva), b"\x90" * length))
+    verify = find_verify_function(img, gate, out)
+    if verify is not None:
+        if out.verbose:
+            out.emit("debug", f"signature verifier RVA 0x{verify:X}")
+        sites.append(PatchSite("verify", verify, img.rva_to_offset(verify), VERIFY_STUB))
+    return sites
 
 
 # ------------------------------------------------------------------ targets ---
@@ -507,6 +542,88 @@ class PatchResult:
     skipped: int = 0
     locked: int = 0
     failed: int = 0
+    verify: int = 0
+
+
+def machine_hwid() -> str | None:
+    if winreg is None:
+        return None
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Cryptography") as key:
+            value, _ = winreg.QueryValueEx(key, "MachineGuid")
+    except OSError:
+        return None
+    return str(value).strip().lower() or None
+
+
+def keystate_path() -> Path:
+    base = os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming")
+    return Path(base) / "ExoPanda" / "shared" / "keystate.json"
+
+
+def keystate_ok() -> bool:
+    try:
+        state = json.loads(keystate_path().read_text(encoding="utf-8"))
+        ent = state.get("entitlement") or {}
+        return (
+            state.get("last_reason") == "ok"
+            and ent.get("hwid")
+            and int(ent.get("expires_at") or 0) > int(time.time() * 1000)
+        )
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+def write_keystate(out: Console, dry_run: bool = False) -> bool:
+    """Plant a machine-bound entitlement that never expires.
+
+    The verifier stub is what makes this stick: the signature is checked by the
+    routine that reports bad_signature, and that routine is patched out before
+    this file lands.
+    """
+    hwid = machine_hwid()
+    if not hwid:
+        out.emit("warn", "MachineGuid unreadable - key state left alone")
+        return False
+
+    path = keystate_path()
+    now = int(time.time() * 1000)
+    far = 4102444800000  # 2100-01-01
+    token = "EXO-0000-0000-0000-0000"
+    state = {
+        "schema_version": 2,
+        "key": token,
+        "server_expires_at": far,
+        "server_time": now,
+        "checked_local_ms": now,
+        "last_reason": "ok",
+        "entitlement": {
+            "v": 1,
+            "key": token,
+            "hwid": hwid,
+            "expires_at": far,
+            "issued_at": now,
+            "grace_until": far,
+            "sig": base64.b64encode(bytes(64)).decode(),
+        },
+    }
+    if dry_run:
+        out.emit("dry", f"would write {path}", f"hwid {hwid}")
+        return True
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        keep = path.with_name(path.name + ".real")
+        if path.exists() and not keep.exists():
+            shutil.copy2(path, keep)
+        if path.exists():
+            os.chmod(path, 0o666)
+        path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        os.chmod(path, 0o444)
+    except OSError as exc:
+        out.emit("err", f"key state not written: {exc}")
+        return False
+    out.emit("ok", "key state planted", f"hwid {hwid}")
+    return True
 
 
 def planning_image(path: Path) -> Image:
@@ -593,9 +710,15 @@ def patch_file(path: Path, root: Path, out: Console, dry_run: bool = False) -> P
             out.emit("err", f"{label}: verification failed at RVA 0x{site.rva:X}")
             result.failed += 1
         else:
-            what = "gate() stubbed" if site.kind == "stub" else "verdict branch forced"
+            what = {
+                "stub": "gate() stubbed",
+                "branch": "verdict branch forced",
+                "verify": "signature check stubbed",
+            }.get(site.kind, site.kind)
             out.emit("ok", f"{label}: {what}", f"RVA 0x{site.rva:X}  file 0x{off:X}")
             result.patched += 1
+            if site.kind == "verify":
+                result.verify += 1
     return result
 
 
@@ -632,7 +755,11 @@ def cmd_status(root: Path, out: Console) -> int:
                     f"RVA 0x{site.rva:X}  0x{gate.end_rva - gate.begin_rva:X} bytes"
                     f"  {gate.markers} markers  {where}"
                 )
-                what = "gate() stubbed" if site.kind == "stub" else "verdict branch forced"
+                what = {
+                    "stub": "gate() stubbed",
+                    "branch": "verdict branch forced",
+                    "verify": "signature check stubbed",
+                }.get(site.kind, site.kind)
                 if state == "patched":
                     out.emit("ok", what, detail)
                     patched += 1
@@ -651,8 +778,16 @@ def cmd_status(root: Path, out: Console) -> int:
     return 0
 
 
+def cmd_key(out: Console, dry_run: bool = False) -> int:
+    out.header(f"key {keystate_path()}")
+    ok = write_keystate(out, dry_run)
+    out.rule()
+    out.emit("ok" if ok else "warn", "key state ready" if ok else "key state unchanged")
+    return 0 if ok else 1
+
+
 def cmd_patch(root: Path, out: Console, dry_run: bool, wait: float = 0.0,
-              scope: str = "all", kill: bool = True) -> int:
+              scope: str = "all", kill: bool = True, keyless: bool = True) -> int:
     out.header(f"patch {root}")
     if kill and not dry_run:
         closed = terminate_exopanda(out)
@@ -669,6 +804,7 @@ def cmd_patch(root: Path, out: Console, dry_run: bool, wait: float = 0.0,
 
     deadline = time.monotonic() + max(wait, 0.0)
     total = PatchResult()
+    verifies = 0
     while True:
         total = PatchResult()
         for path in paths:
@@ -678,12 +814,17 @@ def cmd_patch(root: Path, out: Console, dry_run: bool, wait: float = 0.0,
             total.skipped += res.skipped
             total.locked += res.locked
             total.failed += res.failed
+            total.verify += res.verify
 
+        verifies += total.verify
         if not total.locked or dry_run or time.monotonic() >= deadline:
             break
         left = int(deadline - time.monotonic())
         out.emit("info", "waiting for the app to exit", f"{total.locked} locked, {left}s left")
         time.sleep(2)
+
+    if verifies and not dry_run and keyless:
+        write_keystate(out)
 
     out.rule()
     if dry_run:
@@ -776,11 +917,14 @@ def cmd_diag(root: Path, out: Console) -> int:
     return 0
 
 
-def cmd_auto(root: Path, out: Console, interval: float, kill: bool = False) -> int:
+def cmd_auto(root: Path, out: Console, interval: float, kill: bool = False,
+             keyless: bool = True) -> int:
     if kill:
         closed = terminate_exopanda(out)
         if closed:
             out.emit("info", "app closed", f"{closed} process(es)")
+    if keyless and not keystate_ok():
+        write_keystate(out)
     out.emit("info", "watching", f"{root}")
 
     known: dict[Path, tuple[int, int]] = {}
@@ -890,6 +1034,8 @@ def cmd_auto(root: Path, out: Console, interval: float, kill: bool = False) -> i
 
                 pending.discard(path)
                 res = patch_file(path, root, out)
+                if res.verify and keyless:
+                    write_keystate(out)
                 if res.locked:
                     pending.add(path)
                     continue
@@ -925,7 +1071,7 @@ def main(argv: list[str]) -> int:
         "action",
         nargs="?",
         default="auto",
-        choices=("auto", "status", "patch", "diag", "restore"),
+        choices=("auto", "status", "patch", "diag", "key", "restore"),
         help="auto (default): patch now, then watch for new or updated binaries",
     )
     parser.add_argument(
@@ -944,6 +1090,8 @@ def main(argv: list[str]) -> int:
                         help="patch: only module binaries, leave the launcher stock")
     parser.add_argument("--no-kill", action="store_true",
                         help="do not close ExoPanda or its modules before writing")
+    parser.add_argument("--keep-key", action="store_true",
+                        help="leave the existing key state alone instead of planting one")
     parser.add_argument("-v", "--verbose", action="store_true", help="debug logging")
     parser.add_argument("--no-color", action="store_true", help="disable ANSI colors")
     args = parser.parse_args(argv[1:])
@@ -960,16 +1108,19 @@ def main(argv: list[str]) -> int:
     elif args.modules_only:
         scope = "modules"
     kill = not args.no_kill
+    keyless = not args.keep_key
 
     if args.action == "status":
         return cmd_status(root, out)
+    if args.action == "key":
+        return cmd_key(out, args.dry_run)
     if args.action == "patch":
-        return cmd_patch(root, out, args.dry_run, args.wait, scope, kill)
+        return cmd_patch(root, out, args.dry_run, args.wait, scope, kill, keyless)
     if args.action == "diag":
         return cmd_diag(root, out)
     if args.action == "restore":
         return cmd_restore(root, out, kill)
-    return cmd_auto(root, out, max(0.5, args.interval), kill)
+    return cmd_auto(root, out, max(0.5, args.interval), kill, keyless)
 
 
 if __name__ == "__main__":

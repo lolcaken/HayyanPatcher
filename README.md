@@ -24,6 +24,7 @@ HayyanPatcher.bat                  fetch latest build, then patch + watch
 HayyanPatcher.bat status           report only
 HayyanPatcher.bat patch            one pass, exit
 HayyanPatcher.bat diag             per-binary detail: marker, site, lock, backup
+HayyanPatcher.bat key              re-plant the key state
 HayyanPatcher.bat restore          roll back from .orig backups
 HayyanPatcher.bat -v               verbose discovery log
 ```
@@ -70,12 +71,34 @@ mov  rax, rcx
 ret
 ```
 
-**Modules — verdict branch forced.** A module's gate lives inside the same
-routine that loads its engine DLL and starts the macro. Replacing its prologue
-would skip the macro start entirely — the window opens, the macro does nothing.
-Instead the patcher finds the conditional jump that skips the `gate-ok` path and
-replaces it with NOPs, so the routine still runs in full and only the denial
-path becomes unreachable.
+**Modules — verdict branch forced + verifier stubbed.** A module's gate lives
+inside the same routine that loads its engine DLL and starts the macro.
+Replacing its prologue would skip the macro start entirely — the window opens,
+the macro does nothing. Instead the patcher makes two smaller edits:
+
+- the conditional jump that skips the `gate-ok` path becomes NOPs, so the
+  routine runs in full and only the denial path is unreachable
+- the entitlement verifier — the routine that returns `bad_signature` — gets a
+  five-byte prologue that returns success, so the signature on the key state is
+  no longer checked
+
+## Key state
+
+After the verifier stub lands, the patcher plants
+`%APPDATA%\ExoPanda\shared\keystate.json`:
+
+- the machine's own `MachineGuid` as `hwid`
+- `expires_at` and `grace_until` set to 2100
+- any 64-byte signature (the verifier no longer reads it)
+
+The file is then marked read-only, because both the hub and the module
+revalidate against the server and will happily overwrite it with
+`last_reason: "invalid"`. Read-only blocks the replace; the patched binaries
+never look at the signature anyway.
+
+The original file is kept once as `keystate.json.real`. Re-running
+`HayyanPatcher.exe key` re-plants the forged state; `--keep-key` disables
+planting entirely.
 
 ## How discovery works
 
@@ -115,6 +138,6 @@ that record only byte counts still validate.
 - Module updates replace the patched exe; auto mode re-patches them.
 - The binaries are code-signed; patching invalidates the signature. Windows does
   not enforce that for local execution.
-- Without any key state on the machine a module logs `[0x6B10] gate-none` and
-  will not start its macro. The patcher removes the key check, not the key state
-  the engine reads afterwards.
+- The planted key state is a valid cache for the patched binaries only. Run
+  `restore` and the stock binaries will reject it — the original is still at
+  `keystate.json.real` if a real key was ever entered.
