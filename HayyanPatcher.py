@@ -523,7 +523,7 @@ def cmd_patch(root: Path, out: Console, dry_run: bool) -> int:
     elif total.failed:
         out.emit("warn", f"completed with {total.failed} failure(s)")
     else:
-        out.emit("ok", "all gated binaries patched", f"{total.patched} site(s)")
+        out.emit("ok", "exopanda patched lol", f"{total.patched} site(s)")
     return 1 if total.failed else 0
 
 
@@ -552,7 +552,6 @@ def cmd_restore(root: Path, out: Console) -> int:
 
 
 def cmd_auto(root: Path, out: Console, interval: float) -> int:
-    out.header("HayyanPatcher - auto mode")
     out.emit("info", "watching", f"{root}")
 
     known: dict[Path, tuple[int, int]] = {}
@@ -562,6 +561,7 @@ def cmd_auto(root: Path, out: Console, interval: float) -> int:
     last_procs: set[str] = set()
     rescan_at = 0.0
     self_pid = os.getpid()
+    batch_patched = 0
 
     def stat_key(path: Path) -> tuple[int, int] | None:
         try:
@@ -660,9 +660,14 @@ def cmd_auto(root: Path, out: Console, interval: float) -> int:
                 if res.locked:
                     pending.add(path)
                     continue
+                batch_patched += res.patched
                 key = stat_key(path)
                 if key:
                     known[path] = key
+
+            if batch_patched and not pending:
+                out.emit("ok", "exopanda patched lol")
+                batch_patched = 0
 
             if out.verbose:
                 out.emit("debug", f"tracking {len(gated)} gated file(s), "
