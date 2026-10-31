@@ -523,7 +523,7 @@ def cmd_patch(root: Path, out: Console, dry_run: bool) -> int:
     elif total.failed:
         out.emit("warn", f"completed with {total.failed} failure(s)")
     else:
-        out.emit("ok", "exopanda patched lol", f"{total.patched} site(s)")
+        out.emit("ok", "exopanda vibecoded slop patched ez", f"{total.patched} site(s)")
     return 1 if total.failed else 0
 
 
@@ -666,7 +666,7 @@ def cmd_auto(root: Path, out: Console, interval: float) -> int:
                     known[path] = key
 
             if batch_patched and not pending:
-                out.emit("ok", "exopanda patched lol")
+                out.emit("ok", "exopanda vibecoded slop patched ez")
                 batch_patched = 0
 
             if out.verbose:
