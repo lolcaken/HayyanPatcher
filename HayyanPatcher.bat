@@ -3,18 +3,6 @@ setlocal EnableExtensions EnableDelayedExpansion
 chcp 65001 >nul 2>&1
 title HayyanPatcher
 
-rem ===========================================================================
-rem  HayyanPatcher launcher.
-rem
-rem  Pulls the current HayyanPatcher.exe from GitHub, verifies it against the
-rem  published sha256, then runs it. No arguments means auto mode: patch the
-rem  ExoPanda install, then keep watching for new modules and updates.
-rem
-rem  Override endpoints before launch if you host your own build:
-rem      set PATCH_EXE=https://.../HayyanPatcher.exe
-rem      set PATCH_SHA=https://.../HayyanPatcher.sha256
-rem ===========================================================================
-
 set "APP=HayyanPatcher"
 set "CACHE=%LOCALAPPDATA%\HayyanPatcher"
 set "EXE=%CACHE%\%APP%.exe"
@@ -29,7 +17,6 @@ if not defined PATCH_SHA_MIRROR set "PATCH_SHA_MIRROR=https://raw.githubusercont
 
 if not exist "%CACHE%" mkdir "%CACHE%" >nul 2>&1
 
-rem -- one instance is enough -------------------------------------------------
 tasklist /fi "imagename eq %APP%.exe" 2>nul | find /i "%APP%.exe" >nul
 if not errorlevel 1 (
     echo   = %APP%.exe is already running - not starting a second copy.
@@ -38,14 +25,12 @@ if not errorlevel 1 (
     exit /b 0
 )
 
-rem -- seed the cache from next to this script --------------------------------
 if not exist "%EXE%" if exist "%~dp0%APP%.exe" copy /y "%~dp0%APP%.exe" "%EXE%" >nul 2>&1
 
 echo.
 echo   HayyanPatcher
 echo   ------------
 
-rem -- published checksum -----------------------------------------------------
 set "REMOTE_SHA="
 call :download "%PATCH_SHA%" "%TMPFILE%.sha"
 if errorlevel 1 call :download "%PATCH_SHA_MIRROR%" "%TMPFILE%.sha"
@@ -70,7 +55,6 @@ if defined REMOTE_SHA if /i "%REMOTE_SHA%"=="%LOCAL_SHA%" (
     goto :run
 )
 
-rem -- fetch ------------------------------------------------------------------
 echo   * fetching build
 call :download "%PATCH_EXE%" "%TMPFILE%"
 if errorlevel 1 call :download "%PATCH_EXE_MIRROR%" "%TMPFILE%"
@@ -79,7 +63,7 @@ if errorlevel 1 goto :offline
 set "PAYLOAD_OK="
 for %%F in ("%TMPFILE%") do if %%~zF GEQ %MINSIZE% set "PAYLOAD_OK=1"
 if not defined PAYLOAD_OK (
-    echo   ! payload too small - keeping the cached build
+    echo   - payload too small - keeping the cached build
     del /q "%TMPFILE%" >nul 2>&1
     goto :offline
 )
@@ -88,7 +72,7 @@ if defined REMOTE_SHA (
     set "NEW_SHA="
     call :hash "%TMPFILE%" NEW_SHA
     if /i not "!NEW_SHA!"=="%REMOTE_SHA%" (
-        echo   ! checksum mismatch - keeping the cached build
+        echo   - checksum mismatch - keeping the cached build
         del /q "%TMPFILE%" >nul 2>&1
         goto :offline
     )
@@ -96,7 +80,7 @@ if defined REMOTE_SHA (
     set "MAGIC="
     for /f "delims=" %%M in ('powershell -NoProfile -Command "try{$b=[IO.File]::ReadAllBytes('%TMPFILE%'); if($b[0] -eq 77 -and $b[1] -eq 90){'mz'}else{'no'}}catch{'no'}"') do set "MAGIC=%%M"
     if /i not "!MAGIC!"=="mz" (
-        echo   ! payload is not a PE executable - keeping the cached build
+        echo   - payload is not a PE executable - keeping the cached build
         del /q "%TMPFILE%" >nul 2>&1
         goto :offline
     )
@@ -104,7 +88,7 @@ if defined REMOTE_SHA (
 
 move /y "%TMPFILE%" "%EXE%" >nul 2>&1
 if errorlevel 1 (
-    echo   ! cannot replace %APP%.exe - it is locked
+    echo   - cannot replace %APP%.exe - it is locked
     del /q "%TMPFILE%" >nul 2>&1
     goto :offline
 )
@@ -117,10 +101,10 @@ goto :run
 
 :offline
 if exist "%EXE%" (
-    echo   ! update skipped - running the cached build
+    echo   - update skipped - running the cached build
     goto :run
 )
-echo   x no cached build and the download failed
+echo   - no cached build and the download failed
 echo     put %APP%.exe next to this script, or set PATCH_EXE to a reachable URL.
 echo.
 pause
@@ -131,9 +115,7 @@ echo.
 "%EXE%" %*
 exit /b %errorlevel%
 
-rem ===========================================================================
 :download
-rem %1 = url, %2 = destination. exit 0 when a non-empty file landed.
 set "URL=%~1"
 set "OUT=%~2"
 del /q "%OUT%" >nul 2>&1
@@ -151,7 +133,6 @@ for %%F in ("%~1") do if %%~zF GTR 0 exit /b 0
 exit /b 1
 
 :hash
-rem %1 = file, %2 = variable to receive the sha256
 setlocal EnableDelayedExpansion
 set "LINE="
 for /f "skip=1 delims=" %%H in ('certutil -hashfile "%~1" SHA256 2^>nul') do (
